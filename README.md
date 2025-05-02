@@ -1,5 +1,7 @@
 ## 异步 SOCKS5→HTTP 代理服务器
 
+   注意：不支持dns隐匿，上游socket5不要配置远程dns解析
+
 一个基于 `asyncio` 和（可选）`uvloop` 的高性能 SOCKS5 代理，流量通过上游 HTTP 代理（如 Burp Suite）转发。
 
 ------
