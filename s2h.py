@@ -3,16 +3,18 @@ import logging
 import argparse
 import time
 from collections import defaultdict
+from contextlib import suppress
 
-# Use uvloop for better performance (must be installed)
+# Use uvloop for better performance (optional)
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 except ImportError:
-    pass  # uvloop is optional
+    pass
 
 # Configure logging
 logging.basicConfig(level=logging.WARNING, format='[%(asctime)s] %(levelname)s - %(message)s')
+logging.getLogger("asyncio").setLevel(logging.ERROR)  # suppress noisy asyncio errors
 
 class ConnectionPool:
     def __init__(self, max_idle=10, idle_timeout=300):
@@ -24,13 +26,11 @@ class ConnectionPool:
     async def get_connection(self, host, port):
         key = (host, port)
         async with self.locks[key]:
-            # Reuse a valid idle connection if available
             while self.pool[key]:
                 reader, writer, ts = self.pool[key].pop(0)
                 if writer.is_closing():
                     continue
                 return reader, writer
-            # No idle connection, create new one
             return await asyncio.open_connection(host, port)
 
     async def release_connection(self, host, port, reader, writer):
@@ -38,7 +38,6 @@ class ConnectionPool:
         async with self.locks[key]:
             if writer.is_closing():
                 return
-            # Enforce max idle
             if len(self.pool[key]) >= self.max_idle:
                 writer.close()
                 await writer.wait_closed()
@@ -60,7 +59,7 @@ class ConnectionPool:
                 writer.close()
                 await writer.wait_closed()
 
-# Global pool
+# Global connection pool
 connection_pool = ConnectionPool()
 
 async def handle_socks5(reader, writer, proxy_host, proxy_port):
@@ -82,66 +81,65 @@ async def handle_socks5(reader, writer, proxy_host, proxy_port):
             address = (await reader.readexactly(length)).decode()
         elif addr_type == 4:
             raw = await reader.readexactly(16)
-            address = ":".join(f"{raw[i]:02x}{raw[i+1]:02x}" for i in range(0,16,2))
+            address = ":".join(f"{raw[i]:02x}{raw[i+1]:02x}" for i in range(0, 16, 2))
         else:
             writer.close()
             await writer.wait_closed()
             return
         port = int.from_bytes(await reader.readexactly(2), 'big')
 
-        # Reply "connection granted"
+        # Reply success
         writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
         await writer.drain()
 
-        # Tunnel data
+        # Tunnel via HTTP proxy
         await tunnel(reader, writer, address, port, proxy_host, proxy_port)
     except Exception:
         pass
     finally:
-        writer.close()
-        await writer.wait_closed()
+        with suppress(Exception):
+            writer.close()
+            await writer.wait_closed()
 
 async def tunnel(client_reader, client_writer, addr, port, proxy_host, proxy_port):
     try:
-        # obtain connection to HTTP proxy
         proxy_reader, proxy_writer = await connection_pool.get_connection(proxy_host, proxy_port)
-        # send CONNECT
         proxy_writer.write(f"CONNECT {addr}:{port} HTTP/1.1\r\nHost: {addr}:{port}\r\n\r\n".encode())
         await proxy_writer.drain()
-        # read proxy response
         header = await proxy_reader.readuntil(b"\r\n\r\n")
         if b"200" not in header:
             proxy_writer.close()
             await proxy_writer.wait_closed()
             return
 
-        # bidirectional forwarding
         async def forward(src, dst):
             try:
                 while True:
-                    data = await src.read(64*1024)
+                    data = await src.read(64 * 1024)
                     if not data:
                         break
                     dst.write(data)
-                await dst.drain()
+                    await dst.drain()
             except Exception:
                 pass
             finally:
-                dst.close()
+                with suppress(Exception):
+                    if not dst.is_closing():
+                        dst.close()
 
         await asyncio.gather(
             forward(client_reader, proxy_writer),
             forward(proxy_reader, client_writer)
         )
-        # release proxy connection
+
         await connection_pool.release_connection(proxy_host, proxy_port, proxy_reader, proxy_writer)
     except Exception:
         with suppress(Exception):
-            proxy_writer.close()
-            await proxy_writer.wait_closed()
+            if 'proxy_writer' in locals() and proxy_writer:
+                proxy_writer.close()
+                await proxy_writer.wait_closed()
 
 async def start(socks_host, socks_port, proxy_host, proxy_port):
-    # start idle reaper
     asyncio.create_task(connection_pool.reap_idle())
     server = await asyncio.start_server(
         lambda r, w: handle_socks5(r, w, proxy_host, proxy_port),
